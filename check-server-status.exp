@@ -1,0 +1,34 @@
+#!/usr/bin/expect -f
+
+# 服务器信息
+set server_ip "120.24.22.244"
+set username "root"
+set password "Lyc001286"
+
+# 连接到服务器
+spawn ssh $username@$server_ip
+expect "password:"
+send "$password\r"
+
+# 等待登录完成
+expect "# "
+
+# 检查PM2状态
+send "pm2 list\r"
+expect "# "
+
+# 检查服务器资源使用情况
+send "free -h\r"
+expect "# "
+
+# 检查磁盘使用情况
+send "df -h\r"
+expect "# "
+
+# 检查API配置
+send "cd /var/www/learning-system && cat .env | grep -E 'OPENAI|API'\r"
+expect "# "
+
+# 退出
+send "exit\r"
+expect eof

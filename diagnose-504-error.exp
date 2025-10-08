@@ -1,0 +1,84 @@
+#!/usr/bin/expect -f
+
+# 服务器信息
+set server_ip "120.24.22.244"
+set username "root"
+set password "Lyc001286"
+
+# 连接到服务器
+spawn ssh $username@$server_ip
+expect "password:"
+send "$password\r"
+
+# 等待登录完成
+expect "# "
+
+# 检查PM2状态
+send "echo '=== PM2 Status ==='\r"
+expect "# "
+send "pm2 list\r"
+expect "# "
+
+# 检查PM2日志
+send "echo '=== PM2 Logs ==='\r"
+expect "# "
+send "pm2 logs --lines 20\r"
+expect "# "
+
+# 检查Nginx状态
+send "echo '=== Nginx Status ==='\r"
+expect "# "
+send "systemctl status nginx\r"
+expect "# "
+
+# 检查Nginx错误日志
+send "echo '=== Nginx Error Logs ==='\r"
+expect "# "
+send "tail -20 /var/log/nginx/error.log\r"
+expect "# "
+
+# 检查Nginx访问日志
+send "echo '=== Nginx Access Logs ==='\r"
+expect "# "
+send "tail -20 /var/log/nginx/access.log\r"
+expect "# "
+
+# 检查端口占用
+send "echo '=== Port Usage ==='\r"
+expect "# "
+send "netstat -tlnp | grep -E ':3000|:80|:443'\r"
+expect "# "
+
+# 检查系统资源
+send "echo '=== System Resources ==='\r"
+expect "# "
+send "top -bn1 | head -20\r"
+expect "# "
+
+# 检查磁盘空间
+send "echo '=== Disk Space ==='\r"
+expect "# "
+send "df -h\r"
+expect "# "
+
+# 检查内存使用
+send "echo '=== Memory Usage ==='\r"
+expect "# "
+send "free -h\r"
+expect "# "
+
+# 检查应用目录
+send "echo '=== Application Directory ==='\r"
+expect "# "
+send "cd /var/www/learning-system && ls -la\r"
+expect "# "
+
+# 检查应用进程
+send "echo '=== Application Processes ==='\r"
+expect "# "
+send "ps aux | grep -E 'node|next'\r"
+expect "# "
+
+# 退出
+send "exit\r"
+expect eof

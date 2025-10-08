@@ -1,0 +1,59 @@
+#!/usr/bin/expect -f
+
+set timeout 60
+set server_ip "120.24.22.244"
+set server_user "root"
+set server_password "Lyc001286"
+set server_path "/var/www/learning-system"
+set real_api_key "sk-71380376e8c2418f82c5f05bc3689e1a"
+
+# 连接到服务器
+spawn ssh $server_user@$server_ip
+
+expect {
+    "yes/no" { 
+        send "yes\r"
+        exp_continue
+    }
+    "password:" { 
+        send "$server_password\r"
+    }
+}
+
+# 等待登录成功
+expect "# "
+
+# 进入项目目录
+send "cd $server_path\r"
+expect "# "
+
+# 更新API密钥为真实密钥
+send "sed -i 's/OPENAI_API_KEY=.*/OPENAI_API_KEY=$real_api_key/' .env\r"
+expect "# "
+
+# 验证更新
+send "grep OPENAI_API_KEY .env\r"
+expect "# "
+
+# 重新构建项目
+send "npm run build\r"
+expect "# "
+
+# 重启PM2服务
+send "pm2 restart learning-system || pm2 start npm --name learning-system -- start\r"
+expect "# "
+
+# 等待服务启动
+sleep 3
+
+# 检查PM2状态
+send "pm2 status\r"
+expect "# "
+
+# 检查服务是否正常运行
+send "curl -s http://localhost:3000/api/check-env | head -5\r"
+expect "# "
+
+# 退出
+send "exit\r"
+expect eof

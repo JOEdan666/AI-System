@@ -1,0 +1,110 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model LearningItem {
+  id        String   @id @default(cuid())
+  text      String
+  subject   String
+  createdAt DateTime @default(now())
+}
+
+model KnowledgeBaseItem {
+  id           String   @id @default(cuid())
+  name         String
+  type         String
+  size         Int
+  lastModified BigInt
+  text         String?
+  ocrText      String?
+  notes        String?
+  dataUrl      String?
+  include      Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("knowledge_base_items")
+}
+
+model LearningSession {
+  id               String         @id @default(cuid())
+  conversationId   String         @unique
+  subject          String
+  topic            String
+  aiExplanation    String?
+  socraticDialogue Json?
+  currentStep      String         @default("EXPLAIN")
+  isCompleted      Boolean        @default(false)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  coachingHistory  Json?
+  feedback         String?
+  finalScore       Int?
+  grade            String?
+  region           String?
+  reviewNotes      String?
+  aiSummary        String?
+  quizQuestions    QuizQuestion[]
+  userAnswers      UserAnswer[]
+
+  @@map("learning_sessions")
+}
+
+model QuizQuestion {
+  id            String          @id @default(cuid())
+  sessionId     String
+  question      String
+  type          String
+  options       Json?
+  correctAnswer String
+  explanation   String?
+  difficulty    String          @default("medium")
+  points        Int             @default(1)
+  order         Int
+  createdAt     DateTime        @default(now())
+  session       LearningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  userAnswers   UserAnswer[]
+
+  @@map("quiz_questions")
+}
+
+model UserAnswer {
+  id         String          @id @default(cuid())
+  sessionId  String
+  questionId String
+  userAnswer String
+  isCorrect  Boolean
+  score      Int             @default(0)
+  timeSpent  Int?
+  answeredAt DateTime        @default(now())
+  question   QuizQuestion    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  session    LearningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@map("user_answers")
+}
+
+model LearningStats {
+  id              String   @id @default(cuid())
+  conversationId  String   @unique
+  totalQuestions  Int      @default(0)
+  correctAnswers  Int      @default(0)
+  totalScore      Int      @default(0)
+  maxScore        Int      @default(0)
+  accuracy        Float    @default(0)
+  totalTimeSpent  Int      @default(0)
+  explanationTime Int      @default(0)
+  coachingTime    Int      @default(0)
+  quizTime        Int      @default(0)
+  weaknesses      Json?
+  suggestions     Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("learning_stats")
+}

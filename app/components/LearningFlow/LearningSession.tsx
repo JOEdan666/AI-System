@@ -1,0 +1,1569 @@
+'use client'
+
+import React, { useState, useEffect } from 'react';
+import { LearningSession, LearningState, StudentProfile, LearningStep, LearningMaterial } from '../../types/learning';
+import { ConversationHistory, CreateConversationRequest } from '../../types/conversation';
+import { ConversationService } from '../../services/conversationService';
+import LearningProgressClient from '../../services/learningProgressClient';
+import { ChatMessage, Role } from '../../utils/chatTypes';
+import { createProviderFromEnv } from '../../services/ai';
+import type { AIProvider } from '../../services/ai';
+import ExplainStep from './ExplainStep';
+import ConfirmStep from './ConfirmStep';
+import QuizStep from './QuizStep';
+import ReviewStep from './ReviewStep';
+import ResultStep from './ResultStep';
+import toast from 'react-hot-toast';
+
+// 常量定义
+const DEFAULT_UNDERSTANDING_LEVEL = 3;
+const MAX_QUESTION_COUNT = 8;
+const MIN_UNDERSTANDING_FOR_NEXT = 4;
+const MIN_UNDERSTANDING_WITH_MAX_QUESTIONS = 3;
+const DEFAULT_QUIZ_SCORE = 75;
+
+// 直接定义LearningFlowService类，避免导入问题
+class LearningFlowService {
+  private currentSession: LearningSession | null = null;
+  private aiProvider: AIProvider | null = null;
+
+  constructor() {
+    // 初始化AI Provider
+    this.aiProvider = createProviderFromEnv();
+  }
+
+  // 辅助方法：使用AI Provider发送消息并获取响应
+  private async sendAIMessage(prompt: string): Promise<string> {
+    if (!this.aiProvider) {
+      throw new Error('AI Provider 未初始化');
+    }
+
+    return new Promise((resolve, reject) => {
+      let fullResponse = '';
+      
+      // 设置消息处理器
+      this.aiProvider!.onMessage((message: string, isFinal: boolean) => {
+        fullResponse += message;
+        if (isFinal) {
+          resolve(fullResponse);
+        }
+      });
+      
+      // 设置错误处理器
+      this.aiProvider!.onError((error: string) => {
+        reject(new Error(error));
+      });
+      
+      // 发送消息
+      this.aiProvider!.sendMessage(prompt);
+    });
+  }
+
+  // 开始新的学习会话
+  async startSession(studentId: string, subject: string, topic: string, learningMaterials?: any[]): Promise<LearningSession> {
+    try {
+      // 如果没有提供学习材料，生成默认的学习材料
+      if (!learningMaterials || learningMaterials.length === 0) {
+        learningMaterials = [{ id: `default_${Date.now()}`, content: `这是关于${topic}的默认学习材料。在实际应用中，这里会使用真实的学习内容。`, subject, source: 'default' }];
+      }
+
+      const session: LearningSession = {
+      id: `session_${Date.now()}`,
+      studentId,
+      subject,
+      topic,
+      state: 'EXPLAIN',
+      steps: [],
+      learningMaterials,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      questionCount: 0
+    };
+
+      this.currentSession = session;
+      return session;
+    } catch (error) {
+      console.error('Failed to start learning session:', error);
+      throw error;
+    }
+  }
+
+  // 获取当前会话
+  getCurrentSession(): LearningSession | null {
+    return this.currentSession;
+  }
+
+  // 过滤相关学习材料的公共方法
+  private filterRelevantMaterials(topic: string, subject: string): LearningMaterial[] {
+    if (!this.currentSession?.learningMaterials) {
+      return [];
+    }
+
+    return this.currentSession.learningMaterials.filter((material: LearningMaterial) => {
+      const content = material.content.toLowerCase();
+      const topicLower = topic.toLowerCase();
+      const subjectLower = subject.toLowerCase();
+      
+      // 1. 直接包含完整主题名称
+      if (content.includes(topicLower)) {
+        return true;
+      }
+      
+      // 2. 包含学科名称
+      if (content.includes(subjectLower)) {
+        return true;
+      }
+      
+      // 3. 检查主题关键词（更灵活的匹配）
+      const topicKeywords = topicLower.split(/[\s\-_的]+/).filter(word => word.length > 1);
+      const hasTopicKeyword = topicKeywords.some(keyword => content.includes(keyword));
+      if (hasTopicKeyword) {
+        return true;
+      }
+      
+      // 4. 检查学科相关关键词
+       const subjectKeywords: Record<string, string[]> = {
+         '生物': ['细胞', '基因', '遗传', '系统', '器官', '组织', '分子', '蛋白质', 'dna', 'rna', '激素', '酶', '代谢', '生理', '解剖'],
+         '数学': ['函数', '方程', '几何', '代数', '三角', '概率', '统计', '微积分', '导数', '积分', '向量', '矩阵'],
+         '物理': ['力', '能量', '电', '磁', '光', '声', '热', '运动', '波', '场', '粒子', '原子'],
+         '化学': ['原子', '分子', '离子', '键', '反应', '元素', '化合物', '溶液', '酸', '碱', '氧化', '还原']
+       };
+       
+       const keywords = subjectKeywords[subject] || [];
+       const hasSubjectKeyword = keywords.some((keyword: string) => content.includes(keyword));
+      if (hasSubjectKeyword) {
+        return true;
+      }
+      
+      // 5. 如果是默认材料或用户输入，总是包含
+      if (material.source === 'default' || material.source === 'saved_items' || material.source === 'user_input') {
+        return true;
+      }
+      
+      return false;
+    });
+  }
+
+  // 构建学习材料内容的公共方法
+  private buildMaterialsContent(materials: LearningMaterial[]): string {
+    if (!materials || materials.length === 0) {
+      return '';
+    }
+
+    return materials
+      .map((material: LearningMaterial, index: number) => {
+        const source = material.source || '';
+        const isUserInput = source === 'user_input';
+        const sourceLabel = isUserInput ? '【学生输入内容】' : 
+                           source === 'saved_items' ? '【保存的学习材料】' : 
+                           '【课程材料】';
+        
+        const content = `${sourceLabel} 材料${index + 1}（${material.subject}）：${material.content}`;
+        
+        if (isUserInput) {
+          return content + '\n**重要提示**：这是学生直接输入的学习内容，请在讲解中特别关注并重点回应学生的具体需求。';
+        }
+        
+        return content;
+      })
+      .join('\n\n');
+  }
+
+  // 生成知识点讲解
+  private async generateExplanation(topic: string, subject: string): Promise<string> {
+    // 构建学习材料内容 - 只使用与当前学习主题相关的材料
+    const relevantMaterials = this.filterRelevantMaterials(topic, subject);
+    const materialsContent = this.buildMaterialsContent(relevantMaterials);
+
+    const prompt = `🎭 角色设定
+你是一名【AI学习教练】，负责讲解任何学科或知识点（语文、数学、英语、物理、化学、生物、历史、地理、政治、编程、通识、音乐等）。
+你融合课本知识、考试要求与跨学科创造思维，帮助我真正"学懂—会用—能迁移"。
+你的身份：既是学霸级教练，也是启发式导师。
+
+---
+
+🎯 总目标
+让我真正掌握并能灵活运用知识点，不只是看懂，而是能用于考试、生活和创造。
+讲解内容要有层次，从入门到拔高，配合例题与反思。
+可以引入跨学科或生产创造视角，帮助我建立更深的理解与实践连接。
+
+---
+
+🧠 讲解要求
+请用自然、灵活的方式讲解知识点，语言通俗、逻辑清晰、循序渐进。
+
+当前学习主题：**${topic}**（${subject}学科）
+
+${materialsContent ? `## 📖 课程材料参考
+以下材料为讲解的重要参考，请抽取其中的定义、结论、例题要点：
+${materialsContent}
+> 若材料与常识冲突，以材料为准；若材料缺失信息，可在不冲突前提下补充严谨常识。` : ''}
+
+请用自然、灵活的方式讲解这个知识点，可以包含但不限于以下内容：
+- 核心概念和知识点的清晰解释
+- 原理或推理逻辑的阐述
+- 解题方法或步骤的介绍
+- 实例或生活应用的展示
+- 形式化表达（公式、定义、符号等）
+- 直观理解（例子、类比、表格等）
+- 验证方法或推理步骤
+- 常见题型与解法思路
+- 例题讲解和延伸
+- 易错点提醒
+- 拔高与竞赛拓展
+- 跨学科应用
+- 学习反思和行动建议
+
+## 📝 写作要求
+- 用中文；**加粗**核心术语；重要提示用">"
+- 术语首次出现需给出**符号/单位/定义**
+- 例题过程里对关键步骤**加粗**
+- 内容要丰富充实，信息密度高且句子简洁
+- 避免固定的格式模板，用自然的方式组织内容
+
+## ✅ 质量要求
+确保知识点准确且与材料一致；解题流程可复用；每条结论/公式都有适用条件；例题步骤可逐步复核。
+
+请用生动有趣、逻辑清晰的方式，对"${topic}"进行深入讲解，激发我的思考和解题能力。`;
+
+    try {
+      console.log('[LearningFlowService] 开始生成讲解内容，主题:', topic, '学科:', subject);
+      
+      // 使用Xunfei API生成讲解内容
+      const content = await this.sendAIMessage(prompt);
+      
+      if (content && content.trim()) {
+        console.log('[LearningFlowService] 成功生成讲解内容，长度:', content.length);
+        return content;
+      } else {
+        console.warn('[LearningFlowService] API返回空内容，使用fallback');
+        return this.generateFallbackExplanation(topic, subject);
+      }
+    } catch (error) {
+      console.error('[LearningFlowService] AI生成讲解内容出错:', error);
+      // 出错时返回更详细的fallback内容
+      return this.generateFallbackExplanation(topic, subject);
+    }
+  }
+
+  // 生成fallback讲解内容
+  private generateFallbackExplanation(topic: string, subject: string): string {
+    return `### 📚 核心概念
+**${topic}**是${subject}中的重要概念，需要我们深入理解和掌握。
+
+### 🎯 为什么重要
+在${subject}学习中，${topic}是基础知识点，对后续学习具有重要意义。
+
+### 💡 关键要点
+* **基本定义**：${topic}的基本含义和特征
+* **重要性质**：${topic}具有的主要性质和规律
+* **应用方法**：如何在实际问题中运用${topic}
+
+### ⚠️ 注意事项
+> 学习${topic}时，需要注意理解其本质含义，避免死记硬背，要通过练习加深理解。
+
+*注：当前显示的是默认内容，实际使用中会由AI生成更详细的讲解。*`;
+  }
+
+  // 生成苏格拉底式提问
+
+  // 评估学生回答的方法，改进错误处理
+  private async evaluateStudentAnswer(topic: string, subject: string, studentAnswer: string): Promise<{
+    understanding: number;
+    feedback: string;
+    nextQuestion: string;
+    moveNext: boolean;
+  }> {
+    const questionCount = this.currentSession?.questionCount || 0;
+    
+    // 构建学习材料内容
+    const relevantMaterials = this.filterRelevantMaterials(topic, subject);
+    const materialsContent = this.buildMaterialsContent(relevantMaterials);
+
+    const prompt = `你是一个专业的苏格拉底式AI教练，专门针对${subject}学科的学习。
+学生正在学习"${topic}"这个知识点，现在回答了你的问题："${studentAnswer}"
+
+基于以下学习材料：
+${materialsContent}
+
+请评估学生的回答并生成下一步的引导。请以JSON格式回复：
+
+{
+  "understanding": 数字(1-5，表示理解程度),
+  "feedback": "对学生回答的反馈",
+  "nextQuestion": "下一个苏格拉底式问题",
+  "moveNext": 布尔值(是否可以进入下一阶段)
+}
+
+评估标准：
+1. **理解程度评分**：
+   - 表面理解：能复述基本概念
+   - 深度理解：是否理解原理和本质
+   - 应用能力：能否举例或应用到实际情况
+   - 表达清晰度：逻辑是否清楚
+
+2. **进度控制**：
+   - 如果understanding >= ${MIN_UNDERSTANDING_FOR_NEXT}，设置moveNext为true
+   - 如果已提问超过${MAX_QUESTION_COUNT}次且understanding >= ${MIN_UNDERSTANDING_WITH_MAX_QUESTIONS}，设置moveNext为true
+   - 如果学生回答显示深度理解，可以提前设置moveNext为true
+
+3. **下一个问题**（如果moveNext为false）：
+   - 聚焦于考试重点和核心概念
+   - 避免过于偏门的科学问题
+   - 根据学生当前理解水平调整难度
+   - 问题要具体、有针对性
+
+请确保返回有效的JSON格式。`;
+
+    try {
+      const content = await this.sendAIMessage(prompt);
+      
+      try {
+        const result = JSON.parse(content);
+        return {
+          understanding: Math.max(1, Math.min(5, result.understanding || DEFAULT_UNDERSTANDING_LEVEL)),
+          feedback: result.feedback || '继续努力！',
+          nextQuestion: result.nextQuestion || '请继续思考这个问题。',
+          moveNext: result.moveNext || false
+        };
+      } catch (parseError) {
+        console.error('[LearningFlowService] JSON解析错误:', parseError);
+        return this.getDefaultEvaluation(topic, questionCount);
+      }
+    } catch (error) {
+      console.error('[LearningFlowService] 评估学生回答出错:', error);
+    }
+
+    return this.getDefaultEvaluation(topic, questionCount);
+  }
+
+  // 获取默认评估结果的方法
+  private getDefaultEvaluation(topic: string, questionCount: number) {
+    return {
+      understanding: DEFAULT_UNDERSTANDING_LEVEL,
+      feedback: '你的回答有一定道理，让我们继续深入探讨。',
+      nextQuestion: `关于${topic}，你能举一个具体的例子来说明吗？`,
+      moveNext: questionCount >= MAX_QUESTION_COUNT
+    };
+  }
+
+  private async generateSocraticQuestion(topic: string, subject: string, studentQuestion: string): Promise<string> {
+    // 过滤与当前学习主题相关的学习材料
+    const relevantMaterials = this.filterRelevantMaterials(topic, subject);
+
+    // 构建相关学习材料内容
+    const materialsContent = relevantMaterials.length > 0 
+      ? this.buildMaterialsContent(relevantMaterials)
+      : `当前学习主题：${topic}（${subject}学科）`;
+
+    const prompt = `你是一个专业的苏格拉底式AI教练，专门针对${subject}学科的学习。
+
+${relevantMaterials.length > 0 ? '相关学习材料：' : '学习主题：'}
+${materialsContent}
+
+当前知识点：${topic}
+学生回答/问题：${studentQuestion}
+
+请生成一个高质量的苏格拉底式引导问题，要求：
+
+1. **符合考情**：问题应该与${subject}学科的考试要求和知识体系相符
+2. **层次递进**：根据学生当前理解水平，设计适当难度的问题
+3. **启发思考**：不直接给答案，而是引导学生自己发现和理解
+4. **具体实用**：问题要具体、有针对性，避免过于抽象
+5. **循序渐进**：从简单概念开始，逐步深入到复杂应用
+
+问题类型可以包括：
+- 概念理解类：帮助学生理解基本概念
+- 关联分析类：引导学生思考知识点之间的联系
+- 应用实践类：让学生思考如何在实际情况中应用
+- 对比分析类：通过对比加深理解
+- 原因探究类：引导学生思考"为什么"
+
+请生成一个简洁明了的引导性问题（控制在50字以内）：`;
+
+    try {
+      const content = await this.sendAIMessage(prompt);
+      return content || `让我们从一个基础问题开始：你认为${topic}的核心特征是什么？`;
+    } catch (error) {
+      console.error('[LearningFlowService] 生成苏格拉底式提问出错:', error);
+      return `让我们从一个基础问题开始：你认为${topic}的核心特征是什么？`;
+    }
+  }
+
+  // 生成默认测验题目的公共方法
+  private generateDefaultQuestions(topic: string, subject: string): any[] {
+    return [
+      {
+        id: '1',
+        question: `关于${topic}，以下哪个说法是正确的？`,
+        type: 'multiple_choice',
+        options: ['这是一个重要的概念', '这个概念不重要', '这个概念很难理解', '这个概念没有实际应用'],
+        correctAnswer: 0,
+        explanation: `${topic}确实是一个重要的概念，在${subject}中有广泛的应用。`
+      },
+      {
+        id: '2',
+        question: `${topic}在实际生活中有应用。`,
+        type: 'true_false',
+        options: ['正确', '错误'],
+        correctAnswer: 0,
+        explanation: `${topic}在实际生活中确实有很多应用，是一个实用的知识点。`
+      }
+    ];
+  }
+
+  // 错误处理的公共方法
+  private handleQuizGenerationError(error: any, topic: string, subject: string): any[] {
+    console.error('[LearningFlowService] 生成测验题目出错:', error);
+    return this.generateDefaultQuestions(topic, subject);
+  }
+
+  // 生成测验题目
+  private async generateQuiz(topic: string, subject: string): Promise<any[]> {
+    console.log('[LearningFlowService] 开始生成测验题目，主题:', topic, '学科:', subject);
+    
+    // 过滤与当前主题相关的学习材料
+    const relevantMaterials = this.filterRelevantMaterials(topic, subject);
+
+    // 构建学习材料内容
+    const materialsContent = this.buildMaterialsContent(relevantMaterials);
+
+    const prompt = `请基于"${topic}"这个知识点，生成5道测验题，题型混合（选择题、判断题）。
+请根据以下学习材料生成题目：
+
+${materialsContent}
+
+请以JSON格式回复，包含题目、类型、选项、正确答案和解析：
+
+[
+  {
+    "id": "1",
+    "question": "题目内容",
+    "type": "multiple_choice",
+    "options": ["选项A", "选项B", "选项C", "选项D"],
+    "correctAnswer": 0,
+    "explanation": "解析"
+  },
+  {
+    "id": "2", 
+    "question": "判断题内容",
+    "type": "true_false",
+    "options": ["正确", "错误"],
+    "correctAnswer": 0,
+    "explanation": "解析"
+  }
+]
+
+注意：
+1. correctAnswer 是选项的索引（从0开始）
+2. 题目要基于学习材料，确保准确性
+3. 选项要有一定的迷惑性，但正确答案要明确
+4. 解析要详细说明为什么这个答案是正确的`;
+
+    try {
+      console.log('[LearningFlowService] 发送测验生成请求到AI');
+      
+      const content = await this.sendAIMessage(prompt);
+      console.log('[LearningFlowService] 测验生成AI响应:', content);
+      
+      if (content && content.trim()) {
+        try {
+          // 尝试解析JSON
+          const parsed = JSON.parse(content);
+          console.log('[LearningFlowService] 成功解析测验题目JSON:', parsed);
+            
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              // 验证题目格式
+              const validQuestions = parsed.filter(q => 
+                q.id && q.question && q.type && q.options && 
+                Array.isArray(q.options) && q.options.length > 0 &&
+                typeof q.correctAnswer === 'number' && q.explanation
+              );
+              
+              if (validQuestions.length > 0) {
+                console.log('[LearningFlowService] 验证通过的题目数量:', validQuestions.length);
+                return validQuestions;
+              } else {
+                console.warn('[LearningFlowService] 没有有效的题目，使用默认题目');
+                return this.generateDefaultQuestions(topic, subject);
+              }
+            } else {
+              console.warn('[LearningFlowService] 解析结果不是有效数组，使用默认题目');
+              return this.generateDefaultQuestions(topic, subject);
+            }
+          } catch (parseError) {
+            console.error('[LearningFlowService] 解析测验题目JSON失败:', parseError);
+            console.log('[LearningFlowService] 原始内容:', content);
+            return this.generateDefaultQuestions(topic, subject);
+          }
+        } else {
+          console.warn('[LearningFlowService] AI返回空内容，使用默认题目');
+          return this.generateDefaultQuestions(topic, subject);
+        }
+    } catch (error) {
+      console.error('[LearningFlowService] 测验生成网络错误:', error);
+      return this.handleQuizGenerationError(error, topic, subject);
+    }
+  }
+
+  // 处理学习流程的下一步
+  async nextStep(sessionId: string, currentState: LearningState, userInput: string, isQuestion: boolean = false): Promise<{
+    nextState: LearningState;
+    content: string;
+    data?: any;
+  }> {
+    if (!this.currentSession || this.currentSession.id !== sessionId) {
+      throw new Error('无效的学习会话');
+    }
+
+    // 记录当前步骤
+    const step: any = {
+      id: `step_${Date.now()}`,
+      sessionId,
+      step: currentState,
+      input: { userInput, isQuestion },
+      output: {},
+      createdAt: new Date()
+    };
+
+    let nextState: LearningState = currentState;
+    let content = '';
+    let data: any;
+
+    switch (currentState) {
+      case 'EXPLAIN':
+        // 如果是用户提问，生成针对性解释
+        if (isQuestion) {
+          // 增加问题计数
+          this.currentSession.questionCount = (this.currentSession.questionCount || 0) + 1;
+          
+          const prompt = `学生对"${this.currentSession.topic}"（${this.currentSession.subject}）有以下疑问："${userInput}"。请生成一个清晰、详细的解答，帮助学生理解这个问题。
+要求：
+1. 解释要简单易懂，避免使用过于专业的术语
+2. 提供具体的例子帮助理解
+3. 保持解答在200字以内
+4. 直接回答问题，不要用提问的方式回答学生，也不要问学生任何问题，回复内容中不允许包含任何问句
+5. 使用Markdown格式增强可读性，包括**加粗**重点内容、列表等
+6. 确保回答内容能够完全解决学生的疑问，内容要准确、有针对性`;
+          
+          try {
+            content = await this.sendAIMessage(prompt);
+          } catch (error) {
+            console.error('[LearningFlowService] 生成问题解答出错:', error);
+            content = `这里是对您问题的解答。在实际应用中，这里会由AI生成详细的回答。`;
+          }
+          step.output = { explanation: content, question: userInput };
+          // 保持在EXPLAIN状态，让学生继续提问或理解
+          nextState = 'EXPLAIN';
+        } else {
+          // 学生点击"我已理解，继续"按钮，准备进入知识确认环节
+          if (userInput === 'NEXT_TO_CONFIRM' || userInput.includes('我已理解') || userInput.includes('继续')) {
+            // 进入知识确认环节，生成知识大纲
+            content = '正在为你生成知识大纲...';
+            step.output = { transitionToConfirm: true };
+            nextState = 'CONFIRM';
+          } else {
+            // 初始讲解阶段
+            const explanation = await this.generateExplanation(this.currentSession.topic, this.currentSession.subject);
+            content = explanation;
+            step.output = { explanation };
+            // 保持在EXPLAIN状态，等待学生理解并点击继续
+            nextState = 'EXPLAIN';
+          }
+        }
+        break;
+
+      case 'CONFIRM':
+        // 检查用户输入类型
+        if (userInput.includes('确认理解') || userInput.includes('进行测验') || userInput.includes('开始测验')) {
+          // 用户确认理解，直接进入测验
+          nextState = 'QUIZ';
+          content = '很好！你已经确认理解了知识点。现在让我们通过测验来验证你的学习成果。';
+          step.output = { 
+            confirmed: true,
+            message: content,
+            transitionToQuiz: true 
+          };
+          data = { 
+            confirmed: true,
+            moveNext: true
+          };
+        } else if (userInput.includes('继续讲解') || userInput.includes('没听懂') || userInput.includes('不理解')) {
+          // 用户需要继续讲解，返回EXPLAIN状态
+          nextState = 'EXPLAIN';
+          content = '好的，让我为你继续详细讲解这个知识点。';
+          step.output = { 
+            needMoreExplanation: true,
+            message: content
+          };
+          data = { 
+            needMoreExplanation: true
+          };
+        } else {
+          // 初次进入CONFIRM状态，生成知识大纲
+          const outlinePrompt = `学生刚刚学习了"${this.currentSession.topic}"（${this.currentSession.subject}），现在需要生成一个知识大纲来帮助学生确认理解程度。
+
+请生成一个结构化的知识大纲，包含以下内容：
+
+## 知识概括
+简要概括本知识点的核心内容（50字以内）
+
+## 关键知识点
+列出3-5个最重要的知识点
+
+## 知识框架
+### 核心概念
+列出2-3个核心概念
+### 解题方法  
+列出2-3个主要解题方法
+### 应用场景
+列出2-3个典型应用场景
+
+## 典型例题
+列出1-2个代表性例题
+
+要求：
+- 使用Markdown格式
+- 内容要准确、完整
+- 结构清晰，便于理解
+- 控制在400字以内
+- 重点内容使用**加粗**标记`;
+
+          try {
+            content = await this.sendAIMessage(outlinePrompt);
+          } catch (error) {
+            console.error('[LearningFlowService] 生成知识大纲出错:', error);
+            content = `# ${this.currentSession.topic} 知识大纲
+
+## 知识概括
+这是关于${this.currentSession.topic}的核心知识点概括。
+
+## 关键知识点
+- 核心概念理解
+- 基本原理掌握
+- 解题方法应用
+
+## 知识框架
+### 核心概念
+- 基础概念
+- 重要定理
+
+### 解题方法
+- 基本方法
+- 进阶技巧
+
+### 应用场景
+- 典型题型
+- 实际应用
+
+## 典型例题
+- 基础例题
+- 综合应用题
+
+请确认你是否已经理解了以上知识点和解题方法？`;
+          }
+          
+          step.output = { 
+            outline: content,
+            confirmationPrompt: '请确认你是否已经理解了以上知识点和解题方法？'
+          };
+          data = { 
+            outline: content,
+            showConfirmation: true
+          };
+          nextState = 'CONFIRM';
+        }
+        break;
+
+      case 'QUIZ':
+        // 如果用户输入的是答案，则进行评分
+        if (this.currentSession.steps.some(s => s.step === 'QUIZ' && s.output.questions)) {
+          try {
+            // 解析用户答案
+            let userAnswers: number[] = [];
+            try {
+              userAnswers = JSON.parse(userInput);
+            } catch (e) {
+              // 如果不是JSON格式，尝试其他解析方式
+              userAnswers = userInput.split(',').map(a => parseInt(a.trim())).filter(n => !isNaN(n));
+            }
+
+            // 获取题目
+            const quizStep = this.currentSession.steps.find(s => s.step === 'QUIZ' && s.output.questions);
+            const questions = quizStep?.output.questions || [];
+            
+            // 计算得分
+            let correctCount = 0;
+            if (Array.isArray(questions) && questions.length > 0) {
+              correctCount = userAnswers.reduce((count, answer, index) => {
+                if (index < questions.length && answer === questions[index].correctAnswer) {
+                  return count + 1;
+                }
+                return count;
+              }, 0);
+            }
+            
+            const score = questions.length > 0 ? Math.round((correctCount / questions.length) * 100) : 0;
+            content = `测验完成！你的得分是 ${score} 分。`;
+            step.output = { quizResult: { score, correctCount, totalQuestions: questions.length } };
+            data = { score, correctCount, totalQuestions: questions.length };
+            nextState = 'REVIEW';
+          } catch (error) {
+            console.error('[LearningSession] 测验评分出错:', error);
+            content = `测验完成！你的得分是 ${DEFAULT_QUIZ_SCORE} 分。`;
+            step.output = { quizResult: { score: DEFAULT_QUIZ_SCORE } };
+            data = { score: DEFAULT_QUIZ_SCORE };
+            nextState = 'REVIEW';
+          }
+        } else {
+          // 生成测验题目
+          try {
+            const questions = await this.generateQuiz(this.currentSession.topic, this.currentSession.subject);
+            content = '测验题目已生成，请开始答题。';
+            step.output = { questions };
+            data = { questions };
+            // 保持QUIZ状态，等待用户回答
+          } catch (error) {
+            console.error('[LearningSession] 生成测验题目出错:', error);
+            // 提供默认题目
+            const defaultQuestions = this.generateDefaultQuestions(this.currentSession.topic, this.currentSession.subject);
+            content = '测验题目已生成，请开始答题。';
+            step.output = { questions: defaultQuestions };
+            data = { questions: defaultQuestions };
+          }
+        }
+        break;
+
+      case 'REVIEW':
+        content = `恭喜你完成了关于${this.currentSession.topic}的学习！\n\n学习总结：\n- 你掌握了核心概念\n- 能够应用到实际问题中\n- 建议继续深入学习相关内容`;
+        step.output = { review: content };
+        nextState = 'DONE';
+        break;
+
+      default:
+        throw new Error('未知的学习状态');
+    }
+
+    // 更新会话状态
+    this.currentSession.state = nextState;
+    this.currentSession.steps.push(step);
+    this.currentSession.updatedAt = new Date();
+
+    return { nextState, content, data };
+  }
+
+  // 跳过辅导，直接进入测验
+  async skipToQuiz(sessionId: string): Promise<{
+    nextState: LearningState;
+    content: string;
+    data?: any;
+  }> {
+    console.log('[LearningFlowService] skipToQuiz 被调用，sessionId:', sessionId);
+    console.log('[LearningFlowService] currentSession:', this.currentSession);
+    
+    if (!this.currentSession || this.currentSession.id !== sessionId) {
+      console.error('[LearningFlowService] 无效的学习会话');
+      throw new Error('无效的学习会话');
+    }
+
+    // 记录跳过步骤
+    const step: any = {
+      id: `step_${Date.now()}`,
+      sessionId,
+      step: 'QUIZ',
+      input: { userInput: '跳过辅导', isSkip: true },
+      output: { skipped: true },
+      createdAt: new Date()
+    };
+
+    try {
+      console.log('[LearningFlowService] 开始生成测验题目');
+      // 生成测验题目
+      const questions = await this.generateQuiz(this.currentSession.topic, this.currentSession.subject);
+      console.log('[LearningFlowService] 测验题目生成成功:', questions);
+      
+      const content = '测验题目已生成，请开始答题。';
+      step.output.questions = questions;
+
+      // 更新会话状态
+      this.currentSession.state = 'QUIZ';
+      this.currentSession.steps.push(step);
+      this.currentSession.updatedAt = new Date();
+      console.log('[LearningFlowService] 会话状态已更新为 QUIZ');
+
+      return { nextState: 'QUIZ', content, data: { questions } };
+    } catch (error) {
+      console.error('[LearningFlowService] 跳过到测验时生成题目出错:', error);
+      
+      // 提供默认题目
+      const defaultQuestions = this.generateDefaultQuestions(this.currentSession.topic, this.currentSession.subject);
+      console.log('[LearningFlowService] 使用默认题目:', defaultQuestions);
+      
+      const content = '测验题目已生成，请开始答题。';
+      step.output.questions = defaultQuestions;
+
+      // 更新会话状态
+      this.currentSession.state = 'QUIZ';
+      this.currentSession.steps.push(step);
+      this.currentSession.updatedAt = new Date();
+      console.log('[LearningFlowService] 会话状态已更新为 QUIZ (使用默认题目)');
+
+      return { nextState: 'QUIZ', content, data: { questions: defaultQuestions } };
+    }
+  }
+}
+
+interface LearningSessionProps {
+  savedItems: LearningStep[];
+  onExit: () => void;
+  onClose?: () => void;
+  studentProfile?: StudentProfile;
+}
+
+const LearningSessionComponent: React.FC<LearningSessionProps> = ({ savedItems, onExit, onClose, studentProfile }) => {
+  const [session, setSession] = useState<LearningSession | null>(null);
+  const [currentStep, setCurrentStep] = useState<LearningState>('EXPLAIN');
+  const [subject, setSubject] = useState<string>('数学');
+  const [topic, setTopic] = useState<string>('');
+  const [selectedRegion, setSelectedRegion] = useState<string>('全国');
+  const [grade, setGrade] = useState<string>('九年级');
+  const [isInitializing, setIsInitializing] = useState<boolean>(false);
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [stepContent, setStepContent] = useState<string>('');
+  const [stepData, setStepData] = useState<any>(null);
+  const [currentAnswer, setCurrentAnswer] = useState<string>('');
+  const [questionCount, setQuestionCount] = useState<number>(0);
+  
+  // 对话历史相关状态
+  const [conversationHistory, setConversationHistory] = useState<ConversationHistory | null>(null);
+  
+  // 使用useRef来保存learningService实例，避免组件重新渲染时丢失会话状态
+  const learningServiceRef = React.useRef<LearningFlowService>(new LearningFlowService());
+  const learningService = learningServiceRef.current;
+  
+  // 对话服务实例
+  const conversationService = ConversationService.getInstance();
+
+  // 从savedItems中智能提取主题和学科
+  const extractTopicAndSubject = (items: LearningStep[]): { topic: string; subject: string } => {
+    if (!items || items.length === 0) {
+      return { topic: '', subject: '数学' };
+    }
+
+    // 尝试从第一个item的内容中提取主题
+    const firstItem = items[0];
+    let extractedTopic = '';
+    let extractedSubject = '数学'; // 默认学科
+
+    // 检查input中的userInput
+    if (firstItem.input?.userInput) {
+      const content = firstItem.input.userInput;
+      
+      // 扩展的学科主题模式匹配
+      const subjectTopics = {
+        '数学': [
+          '全等三角形', '相似三角形', '直角三角形', '等腰三角形',
+          '二次函数', '一次函数', '反比例函数', '指数函数', '对数函数',
+          '圆的性质', '圆周角', '切线', '弦长',
+          '平行四边形', '矩形', '菱形', '正方形',
+          '概率', '统计', '排列组合',
+          '导数', '积分', '极限',
+          '向量', '坐标系', '解析几何'
+        ],
+        '生物': [
+          '内分泌系统', '神经系统', '循环系统', '呼吸系统', '消化系统',
+          '免疫系统', '生殖系统', '运动系统', '泌尿系统',
+          '细胞结构', '细胞分裂', '遗传', 'DNA', 'RNA', '蛋白质',
+          '光合作用', '呼吸作用', '酶', '激素', '基因',
+          '生态系统', '食物链', '进化', '物种', '生物多样性'
+        ],
+        '物理': [
+          '力学', '电学', '光学', '热学', '声学', '原子物理',
+          '牛顿定律', '动量', '能量', '功率', '电流', '电压',
+          '磁场', '电磁感应', '波动', '干涉', '衍射',
+          '光沿直线传播', '光的反射', '光的折射', '光的色散',
+          '凸透镜', '凹透镜', '平面镜', '球面镜', '光的干涉',
+          '光的衍射', '光的偏振', '激光', '光纤', '光谱',
+          '重力', '摩擦力', '弹力', '压强', '浮力',
+          '简谐运动', '机械波', '声波', '超声波', '次声波',
+          '温度', '热量', '热传递', '热膨胀', '相变',
+          '电场', '电势', '电容', '电阻', '欧姆定律',
+          '交流电', '直流电', '变压器', '发电机', '电动机'
+        ],
+        '化学': [
+          '原子结构', '分子', '化学键', '化学反应', '酸碱',
+          '氧化还原', '有机化学', '无机化学', '元素周期表',
+          '化学平衡', '反应速率', '电化学'
+        ]
+      };
+
+      // 查找匹配的主题和学科
+      for (const [subject, topics] of Object.entries(subjectTopics)) {
+        for (const topic of topics) {
+          if (content.includes(topic)) {
+            extractedTopic = topic;
+            extractedSubject = subject;
+            break;
+          }
+        }
+        if (extractedTopic) break;
+      }
+
+      // 如果没有找到具体主题，尝试从标题或关键词中提取
+      if (!extractedTopic) {
+        // 更灵活的主题提取模式
+        const patterns = [
+          /学习[：:]\s*(.+?)(?:\s|$)/,
+          /主题[：:]\s*(.+?)(?:\s|$)/,
+          /内容[：:]\s*(.+?)(?:\s|$)/,
+          /^(.+?)\s*[-–—]\s*学习/,
+          /^(.+?)\s*学习/,
+          /^(.+?)\s*的\s*(.+?)$/,  // 匹配 "生物的内分泌系统" 格式
+          /(.+?)系统/,  // 匹配各种系统
+          /(.+?)作用/,  // 匹配各种作用
+          /(.+?)结构/   // 匹配各种结构
+        ];
+
+        for (const pattern of patterns) {
+          const match = content.match(pattern);
+          if (match && match[1]) {
+            let topic = match[1].trim();
+            // 如果匹配到 "生物的内分泌系统" 这种格式，提取后面的部分
+            if (match[2]) {
+              topic = match[2].trim();
+              // 同时设置学科
+              const subjectPart = match[1].trim();
+              if (subjectPart.includes('生物')) extractedSubject = '生物';
+              else if (subjectPart.includes('物理')) extractedSubject = '物理';
+              else if (subjectPart.includes('化学')) extractedSubject = '化学';
+              else if (subjectPart.includes('数学')) extractedSubject = '数学';
+            }
+            extractedTopic = topic;
+            break;
+          }
+        }
+      }
+
+      // 增强的学科识别
+      if (content.includes('生物') || content.includes('细胞') || content.includes('基因') || 
+          content.includes('内分泌') || content.includes('神经') || content.includes('循环') ||
+          content.includes('呼吸') || content.includes('消化') || content.includes('免疫') ||
+          content.includes('遗传') || content.includes('进化') || content.includes('生态')) {
+        extractedSubject = '生物';
+      } else if (content.includes('物理') || content.includes('力学') || content.includes('电学') || 
+                 content.includes('光学') || content.includes('光沿') || content.includes('光的') ||
+                 content.includes('透镜') || content.includes('反射') || content.includes('折射') ||
+                 content.includes('磁场') || content.includes('电流') || content.includes('电压') ||
+                 content.includes('重力') || content.includes('摩擦') || content.includes('压强') ||
+                 content.includes('声波') || content.includes('热量') || content.includes('温度')) {
+        extractedSubject = '物理';
+      } else if (content.includes('数学') || content.includes('几何') || content.includes('代数') || content.includes('函数')) {
+        extractedSubject = '数学';
+      } else if (content.includes('化学') || content.includes('原子') || content.includes('分子') || content.includes('反应')) {
+        extractedSubject = '化学';
+      } else if (content.includes('语文') || content.includes('文学')) {
+        extractedSubject = '语文';
+      } else if (content.includes('英语')) {
+        extractedSubject = '英语';
+      }
+    }
+
+    // 如果还是没有提取到主题，尝试从output中提取
+    if (!extractedTopic && firstItem.output?.explanation) {
+      const explanation = firstItem.output.explanation;
+      const titleMatch = explanation.match(/^#\s*(.+?)(?:\n|$)/);
+      if (titleMatch && titleMatch[1]) {
+        extractedTopic = titleMatch[1].trim();
+      }
+    }
+
+    return { 
+      topic: extractedTopic || '', 
+      subject: extractedSubject 
+    };
+  };
+
+  // 组件初始化时提取主题和学科
+  React.useEffect(() => {
+    const { topic: extractedTopic, subject: extractedSubject } = extractTopicAndSubject(savedItems);
+    if (extractedTopic) {
+      setTopic(extractedTopic);
+      setSubject(extractedSubject);
+      
+      // 如果提取到了主题，自动开始学习会话
+      setTimeout(() => {
+        if (extractedTopic.trim()) {
+          initializeSession();
+        }
+      }, 100);
+    }
+  }, [savedItems]);
+
+  // 初始化学习会话
+  const initializeSession = async () => {
+    if (!topic.trim()) {
+      toast.error('请输入学习主题');
+      return;
+    }
+
+    setIsInitializing(true);
+    try {
+      // 创建默认的学习材料，确保即使没有保存的学习材料也能生成详细讲解
+      let learningMaterials = [{ 
+        id: `default_${Date.now()}`,
+        content: `这是关于${topic}的默认学习材料。在实际应用中，这里会使用真实的学习内容。`,
+        subject,
+        source: 'default'
+      }];
+      
+      // 如果有保存的学习材料，优先使用它们，但只使用与当前主题相关的
+      if (savedItems && savedItems.length > 0) {
+        const allMaterials = savedItems.map(item => ({
+          id: item.id,
+          content: item.output?.explanation || item.input?.userInput || '',
+          subject: subject,
+          source: 'saved_items'
+        }));
+        
+        // 过滤与当前学习主题相关的材料（使用更灵活的匹配逻辑）
+        const relevantMaterials = allMaterials.filter(material => {
+          const content = material.content.toLowerCase();
+          const topicLower = topic.toLowerCase();
+          const subjectLower = subject.toLowerCase();
+          
+          // 1. 直接包含完整主题名称
+          if (content.includes(topicLower)) {
+            return true;
+          }
+          
+          // 2. 包含学科名称
+          if (content.includes(subjectLower)) {
+            return true;
+          }
+          
+          // 3. 检查主题关键词（更灵活的分词）
+          const topicKeywords = topicLower.split(/[\s\-_的]+/).filter(word => word.length > 1);
+          const hasTopicKeyword = topicKeywords.some(keyword => content.includes(keyword));
+          if (hasTopicKeyword) {
+            return true;
+          }
+          
+          // 4. 检查学科相关关键词
+          const subjectKeywords: Record<string, string[]> = {
+            '生物': ['细胞', '基因', '遗传', '系统', '器官', '组织', '分子', '蛋白质', 'dna', 'rna', '激素', '酶', '代谢', '生理', '解剖'],
+            '数学': ['函数', '方程', '几何', '代数', '三角', '概率', '统计', '微积分', '导数', '积分', '向量', '矩阵'],
+            '物理': ['力', '能量', '电', '磁', '光', '声', '热', '运动', '波', '场', '粒子', '原子'],
+            '化学': ['原子', '分子', '离子', '键', '反应', '元素', '化合物', '溶液', '酸', '碱', '氧化', '还原']
+          };
+          
+          const keywords = subjectKeywords[subject] || [];
+          const hasSubjectKeyword = keywords.some((keyword: string) => content.includes(keyword));
+          if (hasSubjectKeyword) {
+            return true;
+          }
+          
+          // 5. 如果是用户输入的材料，总是包含
+          if (material.source === 'saved_items' || material.source === 'user_input') {
+            return true;
+          }
+          
+          return false;
+        });
+        
+        // 如果找到相关材料，使用它们；否则使用默认材料
+        if (relevantMaterials.length > 0) {
+          learningMaterials = relevantMaterials;
+        }
+      }
+      
+      // 使用默认学生ID，实际应用中应该从用户会话中获取
+      const studentId = studentProfile?.id || 'default_student';
+      const newSession = await learningService.startSession(studentId, subject, topic, learningMaterials);
+      setSession(newSession);
+      setCurrentStep('EXPLAIN');
+      setQuestionCount(0);
+      
+      // 创建对话历史记录
+      const conversationRequest: CreateConversationRequest = {
+        type: 'learning',
+        subject: subject,
+        topic: topic,
+        learningSession: newSession,
+        initialMessage: {
+          role: 'user' as Role,
+          content: `开始学习${subject}的${topic}`
+        }
+      };
+      
+      const conversation = await conversationService.findOrCreateLearningConversation(conversationRequest);
+      setConversationHistory(conversation);
+      
+      // 保存初始学习会话到数据库
+      try {
+        const initialProgressData = {
+          conversationId: conversation.id,
+          subject: subject,
+          topic: topic,
+          region: selectedRegion,
+          grade: grade,
+          aiExplanation: '',
+          socraticDialogue: [],
+          currentStep: 'EXPLAIN',
+          isCompleted: false
+        };
+        
+        await LearningProgressClient.saveLearningProgress(initialProgressData);
+        console.log('初始学习会话已保存到数据库');
+      } catch (saveError) {
+        console.error('保存初始学习会话失败:', saveError);
+      }
+      
+      // 直接开始第一步，生成AI讲解内容，直接传递newSession避免状态更新延迟问题
+      await processStep('EXPLAIN', '', newSession);
+    } catch (error) {
+      toast.error('初始化学习会话失败');
+      console.error(error);
+    } finally {
+      setIsInitializing(false);
+    }
+  };
+
+  // 处理学习步骤
+  const processStep = async (step: LearningState, userInput: string, currentSession?: LearningSession) => {
+    const sessionToUse = currentSession || session;
+    if (!sessionToUse || !sessionToUse.id) {
+      toast.error('无效的学习会话');
+      return;
+    }
+    
+    setIsProcessing(true);
+    try {
+      // 如果有用户输入，先保存用户消息
+      if (userInput.trim() && conversationHistory) {
+        const userMessage: ChatMessage = {
+          role: 'user' as Role,
+          content: userInput
+        };
+        await conversationService.addMessage(conversationHistory.id, userMessage);
+      }
+      
+      const result = await learningService.nextStep(sessionToUse.id, step, userInput);
+      setStepContent(result.content);
+      setStepData(result.data);
+      setCurrentStep(result.nextState);
+      
+      // 保存AI回复到对话历史
+      if (result.content && conversationHistory) {
+        const assistantMessage: ChatMessage = {
+          role: 'assistant' as Role,
+          content: result.content
+        };
+        const updatedConversation = await conversationService.addMessage(conversationHistory.id, assistantMessage);
+        if (updatedConversation) {
+          setConversationHistory(updatedConversation);
+        }
+        
+        // 如果是EXPLAIN步骤的初始讲解内容，保存到aiExplanation字段
+        if (step === 'EXPLAIN' && !userInput.trim() && result.data?.explanation) {
+          await conversationService.updateConversation(conversationHistory.id, {
+            aiExplanation: result.data.explanation
+          });
+        }
+      }
+      
+      // 更新会话状态
+      const updatedSession = learningService.getCurrentSession();
+      if (updatedSession) {
+        setSession(updatedSession);
+        // 更新问题计数
+        setQuestionCount(updatedSession.questionCount || 0);
+      }
+
+      // 自动保存学习进度到数据库
+      if (conversationHistory && sessionToUse) {
+        try {
+          const progressData = {
+            conversationId: conversationHistory.id,
+            subject: sessionToUse.subject,
+            topic: sessionToUse.topic,
+            region: selectedRegion,
+            grade: grade,
+            aiExplanation: result.data?.explanation || stepContent,
+            socraticDialogue: conversationHistory.messages || [],
+            currentStep: result.nextState,
+            isCompleted: result.nextState === 'DONE'
+          };
+          
+          await LearningProgressClient.saveLearningProgress(progressData);
+          console.log('学习进度已自动保存到数据库');
+        } catch (saveError) {
+          console.error('自动保存学习进度失败:', saveError);
+          // 不显示错误提示，避免干扰用户体验
+        }
+      }
+      
+      // 如果完成学习流程
+      if (result.nextState === 'DONE') {
+        toast.success('恭喜完成本次学习！');
+        
+        // 保存学习完成消息
+        if (conversationHistory) {
+          const completionMessage: ChatMessage = {
+            role: 'assistant' as Role,
+            content: `🎉 恭喜你完成了${sessionToUse.subject}的${sessionToUse.topic}学习！本次学习已保存到对话历史中。`
+          };
+          await conversationService.addMessage(conversationHistory.id, completionMessage);
+        }
+      }
+    } catch (error) {
+      toast.error('处理学习步骤失败: ' + (error as Error).message);
+      console.error('学习步骤处理错误:', error);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // 处理用户输入
+  const handleUserInput = async (input: string) => {
+    if (!session) return;
+    
+    // 格式化用户输入
+    const formattedInput = formatUserInput(input);
+    
+    setIsProcessing(true);
+    try {
+      await processStep(currentStep, formattedInput, session);
+    } catch (error) {
+      toast.error('处理用户输入失败');
+      console.error(error);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // 退出学习会话
+  const handleExit = () => {
+    setSession(null);
+    setCurrentStep('EXPLAIN');
+    setStepContent('');
+    setStepData(null);
+    setCurrentAnswer('');
+    setQuestionCount(0);
+    onExit();
+  };
+
+  // 跳过辅导，直接进入测验
+  const handleSkipToQuiz = async () => {
+    console.log('[LearningSession] handleSkipToQuiz 被调用');
+    console.log('[LearningSession] session:', session);
+    
+    if (!session) {
+      console.log('[LearningSession] session 为空，返回');
+      return;
+    }
+    
+    console.log('[LearningSession] 设置 isProcessing 为 true');
+    setIsProcessing(true);
+    try {
+      console.log('[LearningSession] 调用 learningService.skipToQuiz');
+      const result = await learningService.skipToQuiz(session.id);
+      console.log('[LearningSession] skipToQuiz 结果:', result);
+      
+      setStepContent(result.content);
+      setStepData(result.data);
+      setCurrentStep(result.nextState);
+      console.log('[LearningSession] 状态已更新为:', result.nextState);
+      
+      // 更新会话状态
+      const updatedSession = learningService.getCurrentSession();
+      if (updatedSession) {
+        setSession(updatedSession);
+        console.log('[LearningSession] 会话状态已更新');
+      }
+      
+      toast.success('已跳过辅导环节，直接进入测验');
+    } catch (error) {
+      console.error('[LearningSession] handleSkipToQuiz 错误:', error);
+      toast.error('跳过辅导失败: ' + (error as Error).message);
+    } finally {
+      console.log('[LearningSession] 设置 isProcessing 为 false');
+      setIsProcessing(false);
+    }
+  };
+
+  // 渲染当前步骤
+  const renderCurrentStep = () => {
+    if (!session) return null;
+
+    switch (currentStep) {
+      case 'EXPLAIN':
+        return (
+          <ExplainStep
+            content={stepContent}
+            onNext={() => handleUserInput('NEXT_TO_CONFIRM')}
+            onAskQuestion={(question: string) => {
+              setIsProcessing(true);
+              // 调用nextStep方法，传递isQuestion=true标识这是一个提问
+              learningService.nextStep(session.id, 'EXPLAIN', question, true)
+                .then(result => {
+                  setStepContent(result.content);
+                  setStepData(result.data);
+                  setCurrentStep(result.nextState);
+                  // 保存当前AI回答，用于显示
+                  setCurrentAnswer(result.content);
+                  
+                  // 更新问题计数
+                  const updatedSession = learningService.getCurrentSession();
+                  if (updatedSession) {
+                    setSession(updatedSession);
+                    setQuestionCount(updatedSession.questionCount || 0);
+                  }
+                })
+                .catch(error => {
+                  toast.error('提问处理失败: ' + (error as Error).message);
+                  console.error('提问处理错误:', error);
+                })
+                .finally(() => {
+                  setIsProcessing(false);
+                });
+            }}
+            step={currentStep}
+            onSkipToQuiz={handleSkipToQuiz}
+            questionCount={questionCount}
+            subject={subject}
+            topic={topic}
+            selectedRegion={selectedRegion}
+            grade={grade}
+          />
+        );
+      case 'CONFIRM':
+        return (
+          <ConfirmStep
+            content={stepContent}
+            isLoading={isProcessing}
+            showConfirmation={stepData?.showConfirmation}
+            onConfirmUnderstanding={() => {
+              // 用户确认理解，进入测验
+              setIsProcessing(true);
+              learningService.nextStep(session.id, 'CONFIRM', '确认理解，进行测验')
+                .then(result => {
+                  setStepContent(result.content);
+                  setStepData(result.data);
+                  setCurrentStep(result.nextState);
+                  toast.success('进入测验环节');
+                })
+                .catch(error => {
+                  toast.error('进入测验失败: ' + (error as Error).message);
+                  console.error('进入测验错误:', error);
+                })
+                .finally(() => {
+                  setIsProcessing(false);
+                });
+            }}
+            onContinueExplanation={() => {
+              // 用户需要继续讲解
+              setIsProcessing(true);
+              learningService.nextStep(session.id, 'CONFIRM', '继续讲解')
+                .then(result => {
+                  setStepContent(result.content);
+                  setStepData(result.data);
+                  setCurrentStep(result.nextState);
+                  toast.success('继续为你讲解');
+                })
+                .catch(error => {
+                  toast.error('继续讲解失败: ' + (error as Error).message);
+                  console.error('继续讲解错误:', error);
+                })
+                .finally(() => {
+                  setIsProcessing(false);
+                });
+            }}
+          />
+        );
+      case 'QUIZ':
+        return (
+          <QuizStep
+            knowledgeContent={stepContent}
+            onComplete={(results) => {
+              // 处理测验完成，跳转到结果页面
+              setStepData(results);
+              setCurrentStep('RESULT' as LearningState);
+            }}
+            onBack={() => {
+              setCurrentStep('EXPLAIN');
+            }}
+          />
+        );
+      case 'RESULT':
+        return (
+          <ResultStep
+            key={`result-${Date.now()}`} // 强制重新挂载组件，确保重新评分
+            answers={stepData?.answers || []}
+            questions={stepData?.questions || []}
+            knowledgeContent={stepContent}
+            onRestart={() => setCurrentStep('QUIZ')}
+            onContinue={() => setCurrentStep('REVIEW')}
+          />
+        );
+      case 'REVIEW':
+        return (
+          <ReviewStep
+            content={stepContent}
+            score={stepData?.score || 0}
+            totalQuestions={stepData?.totalQuestions || 1}
+            understandingLevel={stepData?.understanding || 3}
+            onContinue={handleExit}
+            onRestart={() => {
+              setSession(null);
+              setCurrentStep('EXPLAIN');
+              setStepContent('');
+              setStepData(null);
+              setCurrentAnswer('');
+              setQuestionCount(0);
+            }}
+          />
+        );
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className="h-screen bg-gray-900 p-6 overflow-hidden flex flex-col">
+      {!session ? (
+        <div className="max-w-md mx-auto bg-gray-800 border border-gray-600 rounded-lg p-6">
+          <h2 className="text-xl font-bold text-yellow-400 mb-4">开始学习</h2>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-white mb-1">
+                地区
+              </label>
+              <select
+                value={selectedRegion}
+                onChange={(e) => setSelectedRegion(e.target.value)}
+                className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-white"
+              >
+                <option value="全国">全国</option>
+                <option value="广东">广东</option>
+                <option value="北京">北京</option>
+                <option value="上海">上海</option>
+                <option value="江苏">江苏</option>
+                <option value="浙江">浙江</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-white mb-1">
+                年级
+              </label>
+              <select
+                value={grade}
+                onChange={(e) => setGrade(e.target.value)}
+                className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-white"
+              >
+                <option value="七年级">七年级</option>
+                <option value="八年级">八年级</option>
+                <option value="九年级">九年级</option>
+                <option value="高一">高一</option>
+                <option value="高二">高二</option>
+                <option value="高三">高三</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-white mb-1">
+                学科
+              </label>
+              <select
+                value={subject}
+                onChange={(e) => setSubject(e.target.value)}
+                className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-white"
+              >
+                <option value="数学">数学</option>
+                <option value="物理">物理</option>
+                <option value="化学">化学</option>
+                <option value="生物">生物</option>
+                <option value="历史">历史</option>
+                <option value="地理">地理</option>
+                <option value="语文">语文</option>
+                <option value="英语">英语</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-white mb-1">
+                学习主题
+              </label>
+              <input
+                type="text"
+                value={topic}
+                onChange={(e) => setTopic(e.target.value)}
+                placeholder="输入你想学习的主题"
+                className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-white placeholder-gray-400"
+              />
+            </div>
+            <button
+              onClick={initializeSession}
+              disabled={isInitializing || !topic.trim()}
+              className={`w-full py-2 px-4 rounded font-medium ${
+                isInitializing || !topic.trim()
+                  ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                  : 'bg-yellow-400 text-black hover:bg-yellow-500'
+              }`}
+            >
+              {isInitializing ? '初始化中...' : '开始学习'}
+            </button>
+            {onClose && (
+              <button
+                onClick={onClose}
+                className="w-full py-2 px-4 bg-gray-600 text-white rounded hover:bg-gray-700"
+              >
+                取消
+              </button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="max-w-4xl mx-auto flex flex-col h-full">
+          <div className="bg-gray-800 border border-gray-600 rounded-lg p-4 mb-4 flex-shrink-0">
+            <div className="flex justify-between items-center">
+              <h2 className="text-lg font-bold text-yellow-400">
+                {session.subject} - {session.topic}
+              </h2>
+              <button
+                onClick={handleExit}
+                className="px-3 py-1 bg-gray-600 text-white rounded hover:bg-gray-700"
+              >
+                退出
+              </button>
+            </div>
+            <div className="mt-2 text-sm text-white">
+              当前阶段: {
+                currentStep === 'EXPLAIN' && '讲解'
+                || currentStep === 'CONFIRM' && '确认理解'
+                || currentStep === 'QUIZ' && '测验'
+                || currentStep === 'REVIEW' && '复习'
+              }
+            </div>
+          </div>
+          <div className="bg-gray-800 border border-gray-600 rounded-lg flex-1 overflow-hidden">
+            {renderCurrentStep()}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default LearningSessionComponent;
+
+// 添加用户输入格式化函数
+const formatUserInput = (input: string): string => {
+  // 基本清理：去除首尾空格，规范化空格字符
+  let formatted = input.trim().replace(/\s+/g, ' ');
+  
+  // 移除多余的换行符（保留最多两个连续换行符）
+  formatted = formatted.replace(/\n{3,}/g, '\n\n');
+  
+  // 移除特殊字符（保留中文、英文、数字和基本标点）
+  formatted = formatted.replace(/[^\w\s\u4e00-\u9fff.,!?;:()\-]/g, '');
+  
+  return formatted;
+};

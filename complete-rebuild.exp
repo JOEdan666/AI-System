@@ -1,0 +1,65 @@
+#!/usr/bin/expect -f
+
+# 服务器信息
+set server_ip "120.24.22.244"
+set username "root"
+set password "Lyc001286"
+
+# 设置超时时间
+set timeout 300
+
+# 连接到服务器
+spawn ssh $username@$server_ip
+expect "password:"
+send "$password\r"
+
+# 等待登录完成
+expect "# "
+
+# 进入应用目录
+send "cd /var/www/learning-system\r"
+expect "# "
+
+# 停止所有PM2进程
+send "pm2 stop all\r"
+expect "# "
+
+# 删除PM2进程
+send "pm2 delete all\r"
+expect "# "
+
+# 完全清理
+send "rm -rf .next node_modules package-lock.json\r"
+expect "# "
+
+# 重新安装依赖
+send "npm install\r"
+expect "# "
+
+# 构建应用
+send "NODE_ENV=production npm run build\r"
+expect "# "
+
+# 检查构建结果
+send "ls -la .next/\r"
+expect "# "
+
+# 检查BUILD_ID文件
+send "cat .next/BUILD_ID\r"
+expect "# "
+
+# 重新启动应用
+send "pm2 start npm --name 'learning-system' -- start\r"
+expect "# "
+
+# 检查PM2状态
+send "pm2 list\r"
+expect "# "
+
+# 检查应用日志
+send "pm2 logs learning-system --lines 5\r"
+expect "# "
+
+# 退出
+send "exit\r"
+expect eof

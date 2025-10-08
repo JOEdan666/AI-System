@@ -1,0 +1,34 @@
+#!/usr/bin/expect -f
+
+# 服务器信息
+set server_ip "120.24.22.244"
+set username "root"
+set password "Lyc001286"
+
+# 连接到服务器
+spawn ssh $username@$server_ip
+expect "password:"
+send "$password\r"
+
+# 等待登录完成
+expect "# "
+
+# 检查PM2状态
+send "pm2 list\r"
+expect "# "
+
+# 检查PM2日志
+send "pm2 logs --lines 10\r"
+expect "# "
+
+# 如果服务停止了，重新启动
+send "pm2 restart all\r"
+expect "# "
+
+# 再次检查状态
+send "pm2 list\r"
+expect "# "
+
+# 退出
+send "exit\r"
+expect eof

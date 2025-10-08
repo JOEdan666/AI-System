@@ -1,0 +1,76 @@
+#!/usr/bin/expect -f
+
+# 服务器信息
+set server_ip "120.24.22.244"
+set username "root"
+set password "Lyc001286"
+
+# 连接到服务器
+spawn ssh $username@$server_ip
+expect "password:"
+send "$password\r"
+
+# 等待登录完成
+expect "# "
+
+# 进入应用目录
+send "cd /var/www/learning-system\r"
+expect "# "
+
+# 停止PM2服务
+send "echo '=== Stopping PM2 Services ==='\r"
+expect "# "
+send "pm2 stop all\r"
+expect "# "
+
+# 清理旧的构建文件
+send "echo '=== Cleaning Old Build Files ==='\r"
+expect "# "
+send "rm -rf .next\r"
+expect "# "
+
+# 安装依赖
+send "echo '=== Installing Dependencies ==='\r"
+expect "# "
+send "npm install\r"
+expect "# "
+
+# 构建应用
+send "echo '=== Building Application ==='\r"
+expect "# "
+send "npm run build\r"
+expect "# "
+
+# 检查构建结果
+send "echo '=== Checking Build Results ==='\r"
+expect "# "
+send "ls -la .next/\r"
+expect "# "
+
+# 重启PM2服务
+send "echo '=== Restarting PM2 Services ==='\r"
+expect "# "
+send "pm2 start all\r"
+expect "# "
+
+# 检查PM2状态
+send "echo '=== Checking PM2 Status ==='\r"
+expect "# "
+send "pm2 list\r"
+expect "# "
+
+# 重启Nginx
+send "echo '=== Restarting Nginx ==='\r"
+expect "# "
+send "systemctl restart nginx\r"
+expect "# "
+
+# 检查Nginx状态
+send "echo '=== Checking Nginx Status ==='\r"
+expect "# "
+send "systemctl status nginx\r"
+expect "# "
+
+# 退出
+send "exit\r"
+expect eof
